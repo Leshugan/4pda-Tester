@@ -1,0 +1,117 @@
+name: build
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "Project_4PDA_Tester.zip"
+      - ".github/workflows/build.yml"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Unpack sources
+        run: |
+          mkdir -p app
+          unzip -o Project_4PDA_Tester.zip -d app
+          ls -la app
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Read version
+        id: ver
+        run: |
+          cd app
+          VER=$(node -p "require('./version.json').version" 2>/dev/null || echo "1.001")
+          VCODE=$(awk -v v="$VER" 'BEGIN{printf "%d", v*1000+0.5}')
+          if [ "$VCODE" -lt 1001 ]; then VCODE=1001; fi
+          echo "VER=$VER"     >> "$GITHUB_OUTPUT"
+          echo "VCODE=$VCODE" >> "$GITHUB_OUTPUT"
+          echo "version $VER (code $VCODE)"
+
+      - name: Install deps
+        run: |
+          cd app
+          npm install
+
+      - name: Web build
+        run: |
+          cd app
+          npm run build
+
+      - name: Add Android platform
+        run: |
+          cd app
+          npx cap add android
+
+      - name: Inject native plugin
+        run: |
+          cd app
+          PKG_DIR=android/app/src/main/java/leshugan/fuck4pda
+          mkdir -p "$PKG_DIR"
+          cp native/*.java "$PKG_DIR"/
+          ls -la "$PKG_DIR"
+
+      - name: Patch manifest (cleartext for port 993)
+        run: |
+          cd app
+          MAN=android/app/src/main/AndroidManifest.xml
+          grep -q 'usesCleartextTraffic' "$MAN" || \
+            sed -i 's|<application|<application android:usesCleartextTraffic="true"|' "$MAN"
+          grep -q 'android.permission.INTERNET' "$MAN" || \
+            sed -i 's#</manifest>#    <uses-permission android:name="android.permission.INTERNET" />\n</manifest>#' "$MAN"
+          cat "$MAN"
+
+      - name: Set version code / name
+        run: |
+          cd app
+          GRADLE=android/app/build.gradle
+          sed -i "s/versionCode [0-9]\+/versionCode ${{ steps.ver.outputs.VCODE }}/" "$GRADLE"
+          sed -i "s/versionName \"[^\"]*\"/versionName \"${{ steps.ver.outputs.VER }}\"/" "$GRADLE"
+          grep -n "versionCode\|versionName" "$GRADLE"
+
+      - name: Capacitor sync
+        run: |
+          cd app
+          npx cap sync android
+
+      - name: Gradle assembleRelease
+        run: |
+          cd app/android
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon
+
+      - name: Sign APK
+        run: |
+          cd app
+          BT=$(ls -d "$ANDROID_SDK_ROOT"/build-tools/* | sort -V | tail -1)
+          echo "build-tools: $BT"
+          UNSIGNED=$(ls android/app/build/outputs/apk/release/*.apk | head -1)
+          echo "unsigned: $UNSIGNED"
+          "$BT/zipalign" -f -p 4 "$UNSIGNED" aligned.apk
+          "$BT/apksigner" sign \
+            --ks uc.jks --ks-pass pass:updatechecker --key-pass pass:updatechecker --ks-key-alias uc \
+            --out "4PDA Tester v.${{ steps.ver.outputs.VER }}.apk" aligned.apk
+          "$BT/apksigner" verify --print-certs "4PDA Tester v.${{ steps.ver.outputs.VER }}.apk" | head
+          ls -la app/*.apk 2>/dev/null || ls -la *.apk
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: 4PDA-Tester-v${{ steps.ver.outputs.VER }}
+          path: app/4PDA Tester v.${{ steps.ver.outputs.VER }}.apk
+          if-no-files-found: error
+          retention-days: 7
